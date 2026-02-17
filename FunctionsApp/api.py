@@ -11,7 +11,7 @@ from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 
 from DataBase.db_ext import db, login_manager
-from DataBase.modules import GroupMembership, User, StudyGroup, TestSubmission
+from DataBase.models import GroupMembership, User, StudyGroup, TestSubmission
 
 api_bp = Blueprint('api', __name__)
 
@@ -32,7 +32,7 @@ def success(data: dict, status: int=200):
     return jsonify(payload), status
 
 def _field(name:str, lowercase: bool=False) -> str:
-    if not request.js_json:
+    if not request.is_json:
         return ''
     value = str(request.json.get(name,'')).strip()
     return value.lower() if lowercase else value
@@ -47,6 +47,23 @@ def _premium_required(view_func):
         return view_func(*args, **kwargs)
     return wrapper
 
+@login_manager.unauthorized_handler
+def unauthorized():
+    return jsonify({"ok": False, "error": "Login required."}, 401)
+
+def role_required(*roles):
+    def deco(view_func):
+        @wraps(view_func)
+        def wrapper(*args, **kwargs):
+            if not current_user.is_authenticated:
+                return _error("Login required.", 401)
+            if current_user.role not in roles:
+                return _error("Forbidden.", 403)
+            return view_func(*args, **kwargs)
+        return wrapper
+    return deco
+
+
 @api_bp.post('/auth/register')
 @limiter.limit("5 per minute")
 def register():
@@ -58,15 +75,21 @@ def register():
     full_name = _field('Full Name')
     email = _field('Email', lowercase=True)
     password = _field('Password')
+    role = _field('role', lowercase=True)
+
+    if role not in ("student", "teacher"):
+        return _error("role must be 'student' or 'teacher'.", 400)
 
     if not full_name or not email or not password:
         return _error('full_name, email and password are required.', 400)
+
     if len(password) < 8:
         return _error('Password must be at least 8 characters long.', 400)
+
     if User.query.filter_by(email=email).first():
         return _error('Email already exists.', 409)
 
-    user = User(full_name=full_name, email=email)
+    user = User(full_name=full_name, email=email, role=role)
     user.set_password(password)
     db.session.add(user)
     db.session.commit()
@@ -107,6 +130,22 @@ def logout():
 @api_bp.get('/dashboard')
 @login_required
 def dashboard():
+
+    base_user = {
+        "id": current_user.id,
+        "full_name": current_user.full_name,
+        "email": current_user.email,
+        "role": current_user.role,
+        "paid_member": current_user.paid_member,
+    }
+
+    if current_user.is_teacher:
+        my_groups = StudyGroup.query.filter_by(owner_id=current_user.id).all()
+        return success({
+            "user": base_user,
+            "groups_created": [{"id": g.id, "name": g.name, "subject": g.subject} for g in my_groups],
+        })
+
     submissions = TestSubmission.query.filter_by(user_id=current_user.id).all()
     my_groups = StudyGroup.query.filter_by(owner_id=current_user.id).all()
     joined_groups = (
@@ -140,6 +179,7 @@ def dashboard():
 
 @api_bp.post('/test')
 @login_required
+@role_required("student")
 def submit_test():
 
     err = require_json()
@@ -231,7 +271,7 @@ def get_group(group_id):
 
 @api_bp.post("/groups")
 @login_required
-@_premium_required
+@role_required("teacher")
 def create_group():
 
     err = require_json()
@@ -269,6 +309,7 @@ def create_group():
     return success({"message": "Study group created successfully.", "id": group.id}, 201)
 
 @api_bp.post("/groups/<int:group_id>/join")
+@role_required("student")
 @login_required
 def join_group(group_id: int):
 
@@ -298,4 +339,4 @@ def join_group(group_id: int):
 
 @login_manager.unauthorized_handler
 def unauthorized():
-    return jsonify({"ok": False, "error": "Login required."}), 401
+    return jsonify({"ok": False, "error": "Login required."}, 401)
